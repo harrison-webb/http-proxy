@@ -1,12 +1,8 @@
 from socket import *
 
-while True:
-    message = input()
-    with socket(AF_INET, SOCK_STREAM) as skt:
-        skt.connect(("", 1234))
-        if message.lower() == "exit":
-            skt.send(b"disconnecting")
-            skt.close()
-            break
-        skt.send(str.encode(message))
-        print(skt.recv(2048))
+with socket(AF_INET, SOCK_STREAM) as skt:
+    skt.connect(("", 2100))
+    skt.send(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    skt.send(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n")
+    skt.send(b"\r\n")
+    skt.close()
