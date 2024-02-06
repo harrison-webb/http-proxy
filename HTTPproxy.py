@@ -1,4 +1,3 @@
-# Place your imports here
 from socket import *
 import signal
 from optparse import OptionParser
@@ -31,6 +30,30 @@ if port is None:
 signal.signal(signal.SIGINT, ctrl_c_pressed)
 
 # TODO: Set up sockets to receive requests
+with socket(AF_INET, SOCK_STREAM) as listen_skt:
+    listen_skt.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+    """
+    1. Create a TCP socket for listening for incoming connections.
+    2. Bind that socket to the address and port for which it should accept connections
+    3. Tell the OS that we plan to accept connections on this socket by calling listen() on it.
+    4. Run a loop that calls accept() on the listening socket. Each call to accept() returns a new socket connected to the client
+    5. Call recv() and send() to transfer byte strings back and forth to the client.
+    6. Call skt.close(). 1 (Implict due to the end of the with block.) Call listen_socket.close().
+    """
+    # bind socket to port 1234 and start it up
+    listen_skt.bind(("", 1234))
+    listen_skt.listen()
+    print("Server started")
+
+    while True:
+        # establish connection with client
+        connection_skt, client_address = listen_skt.accept()
+
+        data = connection_skt.recv(2048)
+        print(f"received from client: {data}")
+        connection_skt.send(b"From server: I hear you loud and clear")
+        connection_skt.close()
+
 
 # IMPORTANT!
 # Immediately after you create your proxy's listening socket add
