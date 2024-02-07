@@ -1,9 +1,13 @@
 from socket import *
 from urllib.parse import urlparse
 from enum import Enum
+import re
 import signal
 from optparse import OptionParser
 import sys
+import logging
+
+logging.basicConfig(level=logging.ERROR)
 
 http_methods = {b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS"}
 
@@ -31,20 +35,29 @@ class ParseError(Enum):
 
 
 def parse_request(message: bytes) -> (ParseError, str, int, str, dict):
-    host, port, path, headers = None, None, None, None
+    """Parse and validate a HTTP request string
+
+    Args:
+        message (bytes): HTTP request string
+        str (str): hostname
+        int (int): port number
+        str (str): path
+        dict (dict): dictionary of <header name>: <header value>
+
+    Returns:
+        5-tuple: (Optional(ParseError), Optional(hostname), Optional(port number), Optional(path), Optional(header dictionary))
+    """
+    host, port, path, headers = None, None, None, {}
     error_type = None
-    # TODO: you'll need to write a function like this of some kind and test it
-    # for your proxy.
 
     # split message into first line and the rest of the headers
-    request_line, headers_text = message.split(b"\r\n", 1)
-    method, url, http_version = request_line.split(" ")
+    request_line, headers_data = message.split(b"\r\n", 1)
 
-    # Request line validation:
-
+    ### Request line validation:
     # Bad request if request line doesn't consist of "<method> <url> <http version>"
-    if len(request_line) != 3:
+    if len(request_line.split(b" ")) != 3:
         return (ParseError.BADREQ, None, None, None, None)
+    method, url, http_version = request_line.split(b" ")
 
     # validate HTTP method
     if method not in http_methods:
@@ -59,10 +72,11 @@ def parse_request(message: bytes) -> (ParseError, str, int, str, dict):
 
     path = url_parse.path  # set path
     # try to split into [hostname, port_number]
+    # if hostname doesn't specify port, default to 80
     hostname_and_port = url_parse.netloc.split(b":")
     host = hostname_and_port[0]
-    if hostname_and_port[1]:
-        port = hostname_and_port[1]
+    if len(hostname_and_port) == 2:
+        port = int(hostname_and_port[1])
     else:
         port = 80
 
@@ -70,14 +84,97 @@ def parse_request(message: bytes) -> (ParseError, str, int, str, dict):
     if http_version != b"HTTP/1.0":
         return (ParseError.BADREQ, None, None, None, None)
 
-    # Headers validation:
-    # TODO
+    ### Parse + validate other headers:
+    # split on newline to isolate each `<header name: <header value>`
+    headers_arr = headers_data.split(b"\r\n")
+    headers_arr = [x for x in headers_arr if x.strip()]  # remove whitespace lines
+    for line in headers_arr:
+        # pattern to match valid header. A valid header is "<name>: <value>"
+        # there is no whitespace before the colon, and one space after it
+        # <value> is allowed to contain a colon, as long as it has text on both sides of it
+        if re.search(r"^[^:]+[^\s]: (([^:]+)|(.*\S:\S.*))$".encode(), line):
+            name, value = line.split(b":", 1)
+        else:
+            # invalid header if it does not match the regex
+            return (ParseError.BADREQ, None, None, None, None)
+
+        # if a header name is already in the "headers" dictionary something is probably wrong
+        if name + b":" in headers:
+            logging.error("(parse_request) Duplicate HTTP header")
+            return (ParseError.BADREQ, None, None, None, None)
+
+        # add "<header name>:", "<header value" to 'headers' dictionary
+        # headers[name + b":"] = value.strip()
+        headers[name] = value.strip()
+
+    # error_type gets set to ParseError.NOTIMPL if request is valid but something other than GET
+    if error_type:
+        return (error_type, None, None, None, None)
 
     return None, host, port, path, headers
 
 
 notimplreq = (ParseError.NOTIMPL, None, None, None, None)
 badreq = (ParseError.BADREQ, None, None, None, None)
+
+requests = [
+    # Just a kick the tires test
+    (
+        b"GET http://www.google.com/ HTTP/1.0\r\n\r\n",
+        (None, b"www.google.com", 80, b"/", {}),
+    ),
+    # 102.2) Test handling of malformed request lines [0.5 points]
+    (b"HEAD http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\n\r\n", notimplreq),
+    (b"POST http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\n\r\n", notimplreq),
+    (b"GIBBERISH http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\n\r\n", badreq),
+    # 102.3) Test handling of malformed header lines [0.5 points]
+    (
+        b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\nthis is not a header\r\n\r\n",
+        badreq,
+    ),
+    (
+        b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\nConnection : close\r\n\r\n",
+        badreq,
+    ),
+    (
+        b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\nConnection:close\r\n\r\n",
+        badreq,
+    ),
+    (
+        b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.9; rv:50.0) Firefox/50.0\r\ngibberish\r\n\r\n",
+        badreq,
+    ),
+    # 102.4) Test handling of malformed URIs [0.5 points]
+    (b"GET www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\n\r\n", badreq),
+    (b"GET http://www.flux.utah.edu HTTP/1.0\r\n\r\n", badreq),
+    (b"GET /cs4480/simple.html HTTP/1.0\r\n\r\n", badreq),
+    (b"GET gibberish HTTP/1.0\r\n\r\n", badreq),
+    # 102.5) Test handling of wrong HTTP versions
+    (b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.1\r\n\r\n", badreq),
+    (b"GET http://www.flux.utah.edu/cs4480/simple.html\r\n\r\n", badreq),
+    (b"GET http://www.flux.utah.edu/cs4480/simple.html 1.0\r\n\r\n", badreq),
+    (b"GET http://www.flux.utah.edu/cs4480/simple.html gibberish\r\n\r\n", badreq),
+    # 103.5) Requests should include the specified headers [0.5 points]
+    (
+        b"GET http://localhost:8080/simple.html HTTP/1.0\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.9; rv:50.0) Firefox/50.0\r\n\r\n",
+        (
+            None,
+            b"localhost",
+            8080,
+            b"/simple.html",
+            {
+                b"Connection": b"close",
+                b"User-Agent": b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.9; rv:50.0) Firefox/50.0",
+            },
+        ),
+    ),
+]
+
+for request, expected in requests:
+    print(f"Testing {request}")
+    parsed = parse_request(request)
+    assert parsed == expected, f"{request} yielded {parsed} instead of {expected}"
+print("All tests passed!")
 
 
 # Start of program execution
@@ -127,6 +224,7 @@ with socket(AF_INET, SOCK_STREAM) as listen_skt:
             break
 
     # parse HTTP request
+
     print(client_request)
 
 
