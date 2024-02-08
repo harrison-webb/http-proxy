@@ -1,3 +1,9 @@
+"""
+Harrison Webb
+Computer Networks Spring 2024
+University of Utah
+"""
+
 from socket import *
 from urllib.parse import urlparse
 from enum import Enum
@@ -10,7 +16,6 @@ import sys
 import logging
 
 logging.basicConfig(level=logging.ERROR)
-
 http_methods = {b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS"}
 
 """
@@ -18,10 +23,8 @@ Big picture:
 1. proxy starts up and begins listening for connections
 2. Establishes connection with client
 3. Proxy reads data from client and ensures client has sent a properly formatted HTTP GET request
-    a. HTTP GET requests end with \r\n\r\n
-    b. If request from client is malformed or headers aren't properly formatted, return 400 response to client
-    c. For valid HTTP requests other than GET, return 501 (not implemented) to client
-4. 
+4. Proxy formats client request and sends it on to the origin server
+5. Proxy waits for response from origin, sends the response back to client, then closes connections
 """
 
 
@@ -34,12 +37,6 @@ def ctrl_c_pressed(signal, frame):
 class ParseError(Enum):
     NOTIMPL = 1
     BADREQ = 2
-
-    def error_response(self):
-        if self == ParseError.NOTIMPL:
-            return b"HTTP/1.0 501 Not Implemented\r\n"
-        else:
-            return b"HTTP/1.0 400 Bad Request\r\n"
 
 
 class ParsedRequest:
@@ -84,7 +81,6 @@ class ParsedRequest:
         Returns:
             bytes: formatted request as a byte string
         """
-        # cursed
         tokens = [
             b"GET ",
             self.path,
@@ -99,8 +95,6 @@ class ParsedRequest:
             b"Connection: close\r\n",
         ]
         result = b"".join(tokens)
-        # result = f"GET {self.path} HTTP/1.0\r\nHost: {self.hostname}:{self.port}\r\nConnection: close\r\n"
-        # also cursed. this just formats the headers dictionary in the proper way
         other_headers = b"\r\n".join(
             [key + b": " + value for key, value in self.headers.items()]
         )
@@ -160,8 +154,8 @@ def parse_request(
     headers_arr = headers_data.split(b"\r\n")
     headers_arr = [x for x in headers_arr if x.strip()]  # remove whitespace lines
     for line in headers_arr:
-        # pattern to match valid header. A valid header is "<name>: <value>"
-        # there is no whitespace before the colon, and one space after it
+        # Pattern to match valid header. A valid header is "<name>: <value>",
+        #   there is no whitespace before the colon, and one space after it
         # <value> is allowed to contain a colon, as long as it has text on both sides of it
         if re.search(r"^[^:]+[^\s]: (([^:]+)|(.*\S:\S.*))$".encode(), line):
             name, value = line.split(b":", 1)
@@ -178,8 +172,7 @@ def parse_request(
             logging.error("(parse_request) Duplicate HTTP header")
             return ParsedRequest(ParseError.BADREQ, None, None, None, None)
 
-        # add "<header name>:", "<header value" to 'headers' dictionary
-        # headers[name + b":"] = value.strip()
+        # add "<header name>", "<header value" to 'headers' dictionary
         headers[name] = value.strip()
 
     # error_type gets set to ParseError.NOTIMPL if request is valid but something other than GET
@@ -187,9 +180,6 @@ def parse_request(
         return ParsedRequest(error_type, None, None, None, None)
 
     return ParsedRequest(None, host, port, path, headers)
-
-
-notimplreq = (ParseError.NOTIMPL, None, None, None, None)
 
 
 # Start of program execution
@@ -209,21 +199,13 @@ if port is None:
 # Set up signal handling (ctrl-c)
 signal.signal(signal.SIGINT, ctrl_c_pressed)
 
-# TODO: Set up sockets to receive requests
+# Set up socket to listen for incoming connections
 with socket(AF_INET, SOCK_STREAM) as listen_skt:
     listen_skt.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-    """
-    1. Create a TCP socket for listening for incoming connections.
-    2. Bind that socket to the address and port for which it should accept connections
-    3. Tell the OS that we plan to accept connections on this socket by calling listen() on it.
-    4. Run a loop that calls accept() on the listening socket. Each call to accept() returns a new socket connected to the client
-    5. Call recv() and send() to transfer byte strings back and forth to the client.
-    6. Call skt.close(). 1 (Implict due to the end of the with block.) Call listen_socket.close().
-    """
+
     # bind socket to specified address + port and start it up
     listen_skt.bind((address, port))
     listen_skt.listen()
-    # print("Server started")
 
     while True:
         # establish connection with client
@@ -233,10 +215,8 @@ with socket(AF_INET, SOCK_STREAM) as listen_skt:
         client_request = b""
         while True:
             data = client_skt.recv(10)
-            # print(f"received from client: {data}")
             client_request += data
             if client_request.endswith(b"\r\n\r\n"):
-                # print("breaking from loop")
                 break
 
         # parse HTTP request
@@ -257,8 +237,7 @@ with socket(AF_INET, SOCK_STREAM) as listen_skt:
             # Forward client's request to origin
             origin_skt.sendall(parsed_request.to_request_string())
 
-            # Get response from origin
-            # read until origin sends empty string, indicating end of stream
+            # Get response from origin-- read until origin sends empty string, indicating end of stream
             origin_response = b""
             while True:
                 temp = origin_skt.recv(4096)
