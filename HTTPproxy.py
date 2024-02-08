@@ -1,7 +1,9 @@
 from socket import *
 from urllib.parse import urlparse
 from enum import Enum
+from dataclasses import dataclass
 import re
+from typing import Optional
 import signal
 from optparse import OptionParser
 import sys
@@ -33,19 +35,88 @@ class ParseError(Enum):
     NOTIMPL = 1
     BADREQ = 2
 
+    def error_response(self):
+        if self == ParseError.NOTIMPL:
+            return b"HTTP/1.0 501 Not Implemented\r\n"
+        else:
+            return b"HTTP/1.0 400 Bad Request\r\n"
 
-def parse_request(message: bytes) -> (ParseError, str, int, str, dict):
-    """Parse and validate a HTTP request string
 
-    Args:
-        message (bytes): HTTP request string
-        str (str): hostname
-        int (int): port number
-        str (str): path
-        dict (dict): dictionary of <header name>: <header value>
+class ParsedRequest:
+    def __init__(
+        self,
+        error: Optional[ParseError],
+        hostname: Optional[bytes],
+        port: Optional[int],
+        path: Optional[bytes],
+        headers: Optional[dict[bytes, bytes]],
+    ):
+        self.error = error
+        self.hostname = hostname
+        self.port = port
+        self.path = path
+        self.headers = headers
+
+    def is_valid_request(self) -> bool:
+        if self.error == ParseError.BADREQ or self.error == ParseError.NOTIMPL:
+            return False
+        else:
+            return True
+
+    def error_response(self):
+        if self.error == ParseError.NOTIMPL:
+            return b"HTTP/1.0 501 Not Implemented\r\n"
+        elif self.error == ParseError.BADREQ:
+            return b"HTTP/1.0 400 Bad Request\r\n"
+        else:
+            logging.error("error_response called on ParsedRequest object with no error")
+            return None
+
+    def to_request_string(self) -> bytes:
+        """Format the ParsedRequest object into a string that can be sent as a valid GET request
+
+        Example:
+            GET /index.html HTTP/1.0
+            Host: cs.utah.edu:8888
+            Connection: close
+            Accept-Language: en-us
+
+        Returns:
+            bytes: formatted request as a byte string
+        """
+        # cursed
+        tokens = [
+            b"GET ",
+            self.path,
+            b" ",
+            b"HTTP/1.0",
+            b"\r\n",
+            b"Host: ",
+            self.hostname,
+            b":",
+            str(self.port).encode(),
+            b"\r\n",
+            b"Connection: close\r\n",
+        ]
+        result = b"".join(tokens)
+        # result = f"GET {self.path} HTTP/1.0\r\nHost: {self.hostname}:{self.port}\r\nConnection: close\r\n"
+        # also cursed. this just formats the headers dictionary in the proper way
+        other_headers = b"\r\n".join(
+            [key + b": " + value for key, value in self.headers.items()]
+        )
+        result = b"".join([result, other_headers, b"\r\n\r\n"])
+        return result
+
+
+def parse_request(
+    message: bytes,
+) -> ParsedRequest:
+    """Parse HTTP request text. Returns (ParseError, None, None, None, None) if the request is bad, or
+    (None, hostname, port number, path, headers dictionary) if request is good
 
     Returns:
-        5-tuple: (Optional(ParseError), Optional(hostname), Optional(port number), Optional(path), Optional(header dictionary))
+        ParsedRequest:
+            class containing, TypeError, hostname, port number, path, and headers dictionary
     """
     host, port, path, headers = None, None, None, {}
     error_type = None
@@ -56,19 +127,19 @@ def parse_request(message: bytes) -> (ParseError, str, int, str, dict):
     ### Request line validation:
     # Bad request if request line doesn't consist of "<method> <url> <http version>"
     if len(request_line.split(b" ")) != 3:
-        return (ParseError.BADREQ, None, None, None, None)
+        return ParsedRequest(ParseError.BADREQ, None, None, None, None)
     method, url, http_version = request_line.split(b" ")
 
     # validate HTTP method
     if method not in http_methods:
-        return (ParseError.BADREQ, None, None, None, None)
+        return ParsedRequest(ParseError.BADREQ, None, None, None, None)
     if method != b"GET":
         error_type = ParseError.NOTIMPL
 
     # validate url, set host, port, and path variables
     url_parse = urlparse(url)
     if url_parse.scheme != b"http" or url_parse.netloc == b"" or url_parse.path == b"":
-        return (ParseError.BADREQ, None, None, None, None)
+        return ParsedRequest(ParseError.BADREQ, None, None, None, None)
 
     path = url_parse.path  # set path
     # try to split into [hostname, port_number]
@@ -82,7 +153,7 @@ def parse_request(message: bytes) -> (ParseError, str, int, str, dict):
 
     # validate HTTP version
     if http_version != b"HTTP/1.0":
-        return (ParseError.BADREQ, None, None, None, None)
+        return ParsedRequest(ParseError.BADREQ, None, None, None, None)
 
     ### Parse + validate other headers:
     # split on newline to isolate each `<header name: <header value>`
@@ -96,12 +167,16 @@ def parse_request(message: bytes) -> (ParseError, str, int, str, dict):
             name, value = line.split(b":", 1)
         else:
             # invalid header if it does not match the regex
-            return (ParseError.BADREQ, None, None, None, None)
+            return ParsedRequest(ParseError.BADREQ, None, None, None, None)
+
+        # Omit "Connection: <value>" header. I add this in manually in ParsedRequest.to_request_string()
+        if name == b"Connection":
+            continue
 
         # if a header name is already in the "headers" dictionary something is probably wrong
         if name + b":" in headers:
             logging.error("(parse_request) Duplicate HTTP header")
-            return (ParseError.BADREQ, None, None, None, None)
+            return ParsedRequest(ParseError.BADREQ, None, None, None, None)
 
         # add "<header name>:", "<header value" to 'headers' dictionary
         # headers[name + b":"] = value.strip()
@@ -109,72 +184,12 @@ def parse_request(message: bytes) -> (ParseError, str, int, str, dict):
 
     # error_type gets set to ParseError.NOTIMPL if request is valid but something other than GET
     if error_type:
-        return (error_type, None, None, None, None)
+        return ParsedRequest(error_type, None, None, None, None)
 
-    return None, host, port, path, headers
+    return ParsedRequest(None, host, port, path, headers)
 
 
 notimplreq = (ParseError.NOTIMPL, None, None, None, None)
-badreq = (ParseError.BADREQ, None, None, None, None)
-
-requests = [
-    # Just a kick the tires test
-    (
-        b"GET http://www.google.com/ HTTP/1.0\r\n\r\n",
-        (None, b"www.google.com", 80, b"/", {}),
-    ),
-    # 102.2) Test handling of malformed request lines [0.5 points]
-    (b"HEAD http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\n\r\n", notimplreq),
-    (b"POST http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\n\r\n", notimplreq),
-    (b"GIBBERISH http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\n\r\n", badreq),
-    # 102.3) Test handling of malformed header lines [0.5 points]
-    (
-        b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\nthis is not a header\r\n\r\n",
-        badreq,
-    ),
-    (
-        b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\nConnection : close\r\n\r\n",
-        badreq,
-    ),
-    (
-        b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\nConnection:close\r\n\r\n",
-        badreq,
-    ),
-    (
-        b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.9; rv:50.0) Firefox/50.0\r\ngibberish\r\n\r\n",
-        badreq,
-    ),
-    # 102.4) Test handling of malformed URIs [0.5 points]
-    (b"GET www.flux.utah.edu/cs4480/simple.html HTTP/1.0\r\n\r\n", badreq),
-    (b"GET http://www.flux.utah.edu HTTP/1.0\r\n\r\n", badreq),
-    (b"GET /cs4480/simple.html HTTP/1.0\r\n\r\n", badreq),
-    (b"GET gibberish HTTP/1.0\r\n\r\n", badreq),
-    # 102.5) Test handling of wrong HTTP versions
-    (b"GET http://www.flux.utah.edu/cs4480/simple.html HTTP/1.1\r\n\r\n", badreq),
-    (b"GET http://www.flux.utah.edu/cs4480/simple.html\r\n\r\n", badreq),
-    (b"GET http://www.flux.utah.edu/cs4480/simple.html 1.0\r\n\r\n", badreq),
-    (b"GET http://www.flux.utah.edu/cs4480/simple.html gibberish\r\n\r\n", badreq),
-    # 103.5) Requests should include the specified headers [0.5 points]
-    (
-        b"GET http://localhost:8080/simple.html HTTP/1.0\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.9; rv:50.0) Firefox/50.0\r\n\r\n",
-        (
-            None,
-            b"localhost",
-            8080,
-            b"/simple.html",
-            {
-                b"Connection": b"close",
-                b"User-Agent": b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.9; rv:50.0) Firefox/50.0",
-            },
-        ),
-    ),
-]
-
-for request, expected in requests:
-    print(f"Testing {request}")
-    parsed = parse_request(request)
-    assert parsed == expected, f"{request} yielded {parsed} instead of {expected}"
-print("All tests passed!")
 
 
 # Start of program execution
@@ -208,25 +223,50 @@ with socket(AF_INET, SOCK_STREAM) as listen_skt:
     # bind socket to specified address + port and start it up
     listen_skt.bind((address, port))
     listen_skt.listen()
-    print("Server started")
+    # print("Server started")
 
-    # establish connection with client
-    connection_skt, client_address = listen_skt.accept()
-
-    # revc from client until termination sequence is sent
-    client_request = b""
     while True:
-        data = connection_skt.recv(10)
-        print(f"received from client: {data}")
-        client_request += data
-        if client_request.endswith(b"\r\n\r\n"):
-            print("breaking from loop")
-            break
+        # establish connection with client
+        client_skt, client_address = listen_skt.accept()
 
-    # parse HTTP request
+        # revc from client until termination sequence is sent
+        client_request = b""
+        while True:
+            data = client_skt.recv(10)
+            # print(f"received from client: {data}")
+            client_request += data
+            if client_request.endswith(b"\r\n\r\n"):
+                # print("breaking from loop")
+                break
 
-    print(client_request)
+        # parse HTTP request
+        logging.debug(client_request.decode())
+        parsed_request = parse_request(client_request)
 
+        # if invalid just send straight back to the client and close the connection
+        if not parsed_request.is_valid_request():
+            client_skt.send(parsed_request.error_response())
+            client_skt.close()
+            continue
 
-while True:
-    pass  # TODO: accept and handle connections
+        logging.debug(parsed_request.to_request_string().decode())
+        # Connect to origin server
+        with socket(AF_INET, SOCK_STREAM) as origin_skt:
+            origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
+
+            # Forward client's request to origin
+            origin_skt.sendall(parsed_request.to_request_string())
+
+            # Get response from origin
+            # read until origin sends empty string, indicating end of stream
+            origin_response = b""
+            while True:
+                temp = origin_skt.recv(4096)
+                if temp == b"":
+                    break
+                origin_response += temp
+
+            # Send response back to client
+            client_skt.sendall(origin_response)
+            client_skt.close()
+            origin_skt.close()
