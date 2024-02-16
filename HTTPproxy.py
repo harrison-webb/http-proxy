@@ -8,6 +8,7 @@ from socket import *
 from urllib.parse import urlparse
 from enum import Enum
 from dataclasses import dataclass
+import threading
 import re
 from typing import Optional
 import signal
@@ -182,6 +183,47 @@ def parse_request(
     return ParsedRequest(None, host, port, path, headers)
 
 
+def communicate_with_client(client_skt: socket, client_address):
+    # revc from client until termination sequence is sent
+    client_request = b""
+    while True:
+        data = client_skt.recv(10)
+        client_request += data
+        if client_request.endswith(b"\r\n\r\n"):
+            break
+
+    # parse HTTP request
+    logging.debug(client_request.decode())
+    parsed_request = parse_request(client_request)
+
+    # if invalid just send straight back to the client and close the connection
+    if not parsed_request.is_valid_request():
+        client_skt.send(parsed_request.error_response())
+        client_skt.close()
+        return
+
+    logging.debug(parsed_request.to_request_string().decode())
+    # Connect to origin server
+    with socket(AF_INET, SOCK_STREAM) as origin_skt:
+        origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
+
+        # Forward client's request to origin
+        origin_skt.sendall(parsed_request.to_request_string())
+
+        # Get response from origin-- read until origin sends empty string, indicating end of stream
+        origin_response = b""
+        while True:
+            temp = origin_skt.recv(4096)
+            if temp == b"":
+                break
+            origin_response += temp
+
+        # Send response back to client
+        client_skt.sendall(origin_response)
+        client_skt.close()
+        origin_skt.close()
+
+
 # Start of program execution
 # Parse out the command line server address and port number to listen to
 parser = OptionParser()
@@ -211,41 +253,7 @@ with socket(AF_INET, SOCK_STREAM) as listen_skt:
         # establish connection with client
         client_skt, client_address = listen_skt.accept()
 
-        # revc from client until termination sequence is sent
-        client_request = b""
-        while True:
-            data = client_skt.recv(10)
-            client_request += data
-            if client_request.endswith(b"\r\n\r\n"):
-                break
-
-        # parse HTTP request
-        logging.debug(client_request.decode())
-        parsed_request = parse_request(client_request)
-
-        # if invalid just send straight back to the client and close the connection
-        if not parsed_request.is_valid_request():
-            client_skt.send(parsed_request.error_response())
-            client_skt.close()
-            continue
-
-        logging.debug(parsed_request.to_request_string().decode())
-        # Connect to origin server
-        with socket(AF_INET, SOCK_STREAM) as origin_skt:
-            origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
-
-            # Forward client's request to origin
-            origin_skt.sendall(parsed_request.to_request_string())
-
-            # Get response from origin-- read until origin sends empty string, indicating end of stream
-            origin_response = b""
-            while True:
-                temp = origin_skt.recv(4096)
-                if temp == b"":
-                    break
-                origin_response += temp
-
-            # Send response back to client
-            client_skt.sendall(origin_response)
-            client_skt.close()
-            origin_skt.close()
+        client_thread = threading.Thread(
+            target=communicate_with_client, args=(client_skt, client_address)
+        )
+        client_thread.start()
