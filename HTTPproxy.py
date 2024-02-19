@@ -2,12 +2,24 @@
 Harrison Webb
 Computer Networks Spring 2024
 University of Utah
+
+Big picture:
+1. proxy starts up and begins listening for connections
+2. Establishes connection with client
+3. Proxy reads data from client and ensures client has sent a properly formatted HTTP GET request
+    a. If client has sent a request containing proxy command, process that and send 200 OK back to client (or 400 if bad command)
+4. If blocklist or cache is enabled, check GET request against the relevant one
+    a. If request is cached, check with origin that object is current, update if not, and send object back to client
+    b. If request is in blocklist, send 403 FORBIDDEN response back to client
+4. Proxy formats client request and sends it on to the origin server
+5. Proxy waits for response from origin, sends the response back to client, then closes connections
 """
 
 from socket import *
 from urllib.parse import urlparse
 from enum import Enum
 from dataclasses import dataclass
+from datetime import datetime
 import threading
 import re
 from typing import Optional
@@ -18,20 +30,21 @@ import logging
 
 logging.basicConfig(level=logging.ERROR)
 http_methods = {b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS"}
-
-"""
-Big picture:
-1. proxy starts up and begins listening for connections
-2. Establishes connection with client
-3. Proxy reads data from client and ensures client has sent a properly formatted HTTP GET request
-4. Proxy formats client request and sends it on to the origin server
-5. Proxy waits for response from origin, sends the response back to client, then closes connections
-"""
+ok_response = b"HTTP/1.0 200 OK\r\n\r\n"
+bad_req_response = (
+    b"HTTP/1.0 400 Bad Request\r\n\r\n"  # used when client sends bad proxy command
+)
 
 
 # Signal handler for pressing ctrl-c
 def ctrl_c_pressed(signal, frame):
     sys.exit(0)
+
+
+@dataclass
+class CacheObject:
+    object: bytes
+    date: datetime
 
 
 # Request parsing
@@ -101,6 +114,59 @@ class ParsedRequest:
         )
         result = b"".join([result, other_headers, b"\r\n\r\n"])
         return result
+
+
+cache: dict[bytes, CacheObject] = {}
+blocklist: set[bytes] = set()
+cache_enabled = False
+blocklist_enabled = False
+
+
+def handle_proxy_command(request: ParsedRequest) -> bytes:
+    if request.path == None:
+        raise ValueError("handle_proxy_command called on request with null path")
+    assert request.path.startswith(b"/proxy")
+
+    response = ok_response
+
+    command = request.path
+    match command:
+        case "/proxy/cache/enable":
+            cache_enabled = True
+        case "/proxy/cache/disable":
+            cache_enabled = False
+        case "/proxy/cache/flush":
+            cache.clear()
+        case "/proxy/blocklist/enable":
+            blocklist_enabled = True
+        case "/proxy/blocklist/disable":
+            blocklist_enabled = False
+        case "/proxy/blocklist/flush":
+            blocklist.clear()
+        case re.match("\/proxy\/blocklist\/add\/\S+"):
+            string_to_add = request.path.split(b"/", 4)[-1]
+            blocklist.add(string_to_add)
+        case re.match("\/proxy\/blocklist\/remove\/\S+"):
+            string_to_remove = request.path.split(b"/", 4)[-1]
+            if string_to_remove in blocklist:
+                blocklist.remove(string_to_remove)
+            else:
+                response = bad_req_response
+        case _:
+            if command.startswith(b"/proxy/blocklist/add/"):
+                string_to_add = request.path.split(b"/", 4)[-1]
+                blocklist.add(string_to_add)
+            elif command.startswith(b"/proxy/blocklist/remove/"):
+                string_to_remove = request.path.split(b"/", 4)[-1]
+                if string_to_remove in blocklist:
+                    blocklist.remove(string_to_remove)
+                else:
+                    response = bad_req_response
+            else:
+                logging.debug(request.path)
+                response = bad_req_response
+
+    return response
 
 
 def parse_request(
@@ -184,6 +250,12 @@ def parse_request(
 
 
 def communicate_with_client(client_skt: socket, client_address):
+    """Once connection is established with a client, revc message from them, forward message to origin server, then forward origin response back to client
+
+    Args:
+        client_skt (socket): Socket connecting client and proxy. Obtained from skt.accept()
+        client_address (_type_): Client address. Unused here
+    """
     # revc from client until termination sequence is sent
     client_request = b""
     while True:
@@ -200,6 +272,13 @@ def communicate_with_client(client_skt: socket, client_address):
     if not parsed_request.is_valid_request():
         client_skt.send(parsed_request.error_response())
         client_skt.close()
+        return
+
+    # check if request is a cache or blocklist command
+    if parsed_request.path.startswith(b"/proxy"):
+        proxy_command_response = handle_proxy_command(parsed_request)
+        client_skt.sendall(proxy_command_response)
+        client_skt.close()  # TODO maybe keep this open?
         return
 
     logging.debug(parsed_request.to_request_string().decode())
