@@ -31,9 +31,12 @@ import logging
 logging.basicConfig(level=logging.ERROR)
 http_methods = {b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS"}
 ok_response = b"HTTP/1.0 200 OK\r\n\r\n"
-bad_req_response = (
-    b"HTTP/1.0 400 Bad Request\r\n\r\n"  # used when client sends bad proxy command
-)
+
+# used when client sends bad proxy command
+bad_req_response = b"HTTP/1.0 400 Bad Request\r\n\r\n"
+
+# used when client attempts to access blocked host
+forbidden_response = b"HTTP/1.0 403 Forbidden\r\n\r\n"
 
 
 # Signal handler for pressing ctrl-c
@@ -123,6 +126,17 @@ blocklist_enabled = False
 
 
 def handle_proxy_command(request: ParsedRequest) -> bytes:
+    """Handles a request sent by the client that contains a command URL for the proxy (e.g. /proxy/cache/enable or /proxy/blacklist/flush)
+
+    Args:
+        request (ParsedRequest): ParsedRequest object containing the client's request
+
+    Raises:
+        ValueError: If the ParsedRequest object has no path this error is thrown (should never happen)
+
+    Returns:
+        bytes: "200 OK" HTTP response message, or "400 Bad Request" if client sends an invalid command URL
+    """
     if request.path == None:
         raise ValueError("handle_proxy_command called on request with null path")
     assert request.path.startswith(b"/proxy")
@@ -167,6 +181,52 @@ def handle_proxy_command(request: ParsedRequest) -> bytes:
                 response = bad_req_response
 
     return response
+
+
+def handle_request_with_blocklist(parsed_request: ParsedRequest, client_skt: socket):
+    host_string = b"".join(
+        [parsed_request.hostname, b":", str(parsed_request.port).encode()]
+    )
+    for blocked in blocklist:
+        # if host_string contains any string that is in the blocklist send "403 Forbidden"
+        if blocked in host_string:
+            client_skt.sendall(forbidden_response)
+
+    handle_request_standard(parsed_request, client_skt)
+
+
+def handle_request_with_cache(parsed_request: ParsedRequest, client_skt: socket):
+    # TODO
+    # 1. check if requested object is in the cache
+    #     a. if not, carry out request like usual
+    #     b. if so, verify object is up to date by issuing conditional GET to origin
+    #         x. if origin response indicates object has not been modified, then good to go
+    #         y. if origin indicates object is out of date, update object per response from origin
+    # 2. If necessary, update cache with up to date version of object and timestamp
+    # 3. respond to client with up to date object
+    True
+
+
+def handle_request_standard(parsed_request: ParsedRequest, client_skt: socket):
+    # Connect to origin server
+    with socket(AF_INET, SOCK_STREAM) as origin_skt:
+        origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
+
+        # Forward client's request to origin
+        origin_skt.sendall(parsed_request.to_request_string())
+
+        # Get response from origin-- read until origin sends empty string, indicating end of stream
+        origin_response = b""
+        while True:
+            temp = origin_skt.recv(4096)
+            if temp == b"":
+                break
+            origin_response += temp
+
+        # Send response back to client
+        client_skt.sendall(origin_response)
+        client_skt.close()
+        origin_skt.close()
 
 
 def parse_request(
@@ -264,7 +324,7 @@ def communicate_with_client(client_skt: socket, client_address):
         if client_request.endswith(b"\r\n\r\n"):
             break
 
-    # parse HTTP request
+    # Parse HTTP request:
     logging.debug(client_request.decode())
     parsed_request = parse_request(client_request)
 
@@ -274,7 +334,7 @@ def communicate_with_client(client_skt: socket, client_address):
         client_skt.close()
         return
 
-    # check if request is a cache or blocklist command
+    # Check if request is a cache or blocklist command:
     if parsed_request.path.startswith(b"/proxy"):
         proxy_command_response = handle_proxy_command(parsed_request)
         client_skt.sendall(proxy_command_response)
@@ -282,25 +342,33 @@ def communicate_with_client(client_skt: socket, client_address):
         return
 
     logging.debug(parsed_request.to_request_string().decode())
-    # Connect to origin server
-    with socket(AF_INET, SOCK_STREAM) as origin_skt:
-        origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
 
-        # Forward client's request to origin
-        origin_skt.sendall(parsed_request.to_request_string())
+    # Handle request processing based on status of blocklist and cache:
+    if blocklist_enabled:
+        handle_request_with_blocklist(parsed_request, client_skt)
+    elif cache_enabled:
+        handle_request_with_cache(parsed_request, client_skt)
+    else:
+        handle_request_standard(parsed_request, client_skt)
+    # # Connect to origin server
+    # with socket(AF_INET, SOCK_STREAM) as origin_skt:
+    #     origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
 
-        # Get response from origin-- read until origin sends empty string, indicating end of stream
-        origin_response = b""
-        while True:
-            temp = origin_skt.recv(4096)
-            if temp == b"":
-                break
-            origin_response += temp
+    #     # Forward client's request to origin
+    #     origin_skt.sendall(parsed_request.to_request_string())
 
-        # Send response back to client
-        client_skt.sendall(origin_response)
-        client_skt.close()
-        origin_skt.close()
+    #     # Get response from origin-- read until origin sends empty string, indicating end of stream
+    #     origin_response = b""
+    #     while True:
+    #         temp = origin_skt.recv(4096)
+    #         if temp == b"":
+    #             break
+    #         origin_response += temp
+
+    #     # Send response back to client
+    #     client_skt.sendall(origin_response)
+    #     client_skt.close()
+    #     origin_skt.close()
 
 
 # Start of program execution
