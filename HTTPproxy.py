@@ -15,7 +15,6 @@ Big picture:
 5. Proxy waits for response from origin, sends the response back to client, then closes connections
 """
 
-import email.utils
 import logging
 import re
 import signal
@@ -29,7 +28,24 @@ from socket import *
 from typing import Optional
 from urllib.parse import urlparse
 
-logging.basicConfig(level=logging.ERROR)
+
+def ctrl_c_pressed(signal, frame):
+    """Signal handler for pressing ctrl-c"""
+    sys.exit(0)
+
+
+logging.basicConfig(level=logging.DEBUG)
+
+
+@dataclass
+class CacheObject:
+    """Used as the value of a url key in the cache. Contains a response corresponding to a url and the response's Last-Modified date"""
+
+    response: bytes
+    date: bytes
+
+
+#### Global Variables ####
 http_methods = {b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS"}
 ok_response = b"HTTP/1.0 200 OK\r\n\r\n"
 
@@ -39,35 +55,27 @@ bad_req_response = b"HTTP/1.0 400 Bad Request\r\n\r\n"
 # used when client attempts to access blocked host
 forbidden_response = b"HTTP/1.0 403 Forbidden\r\n\r\n"
 
+# Proxy cache. Cache keys are `<hostname><path>` and values are CacheObject (response + date)
+cache: dict[bytes, CacheObject] = {}
 
-# Signal handler for pressing ctrl-c
-def ctrl_c_pressed(signal, frame):
-    sys.exit(0)
+# Blocklist just uses a set to store phrases to block
+blocklist: set[bytes] = set()
 
-
-@dataclass
-class CacheObject:
-    response: bytes
-    date: datetime
-
-    def date_to_string(self):
-        # https://stackoverflow.com/a/42693352
-        # this formats October 3rd 2015 as "Sat, 03 Oct 2015 <time> -<something>"
-        # BUG might need to fix the day of month from "03" to "3" # TODO
-        return email.utils.format_datetime(self.date)
-
-    def to_response(self):
-        # TODO
-        True
+# Global flags to toggle cache and blocklist
+cache_enabled = False
+blocklist_enabled = False
 
 
-# Request parsing
 class ParseError(Enum):
+    """Request parsing"""
+
     NOTIMPL = 1
     BADREQ = 2
 
 
 class ParsedRequest:
+    """Parsed (deconstructed) HTTP request"""
+
     def __init__(
         self,
         error: Optional[ParseError],
@@ -83,19 +91,27 @@ class ParsedRequest:
         self.headers = headers
 
     def is_valid_request(self) -> bool:
+        """Detect if the request is valid or not. A valid request has None for the error field"""
         if self.error == ParseError.BADREQ or self.error == ParseError.NOTIMPL:
             return False
         else:
             return True
 
-    def error_response(self):
+    def error_response(self) -> bytes:
+        """Return an error response bytestring corresponding to the type of error a request has
+
+        Returns:
+            bytes: "400 Bad Request" or "501 Not Implemented" HTTP response bytestrings
+        """
         if self.error == ParseError.NOTIMPL:
             return b"HTTP/1.0 501 Not Implemented\r\n"
         elif self.error == ParseError.BADREQ:
             return b"HTTP/1.0 400 Bad Request\r\n"
         else:
-            logging.error("error_response called on ParsedRequest object with no error")
-            return None
+            logging.error(
+                "line 97: error_response called on ParsedRequest object with no error"
+            )
+            return b""
 
     def to_request_string(self) -> bytes:
         """Format the ParsedRequest object into a string that can be sent as a valid GET request
@@ -123,14 +139,25 @@ class ParsedRequest:
             b"Connection: close\r\n",
         ]
         result = b"".join(tokens)
-        other_headers = b"\r\n".join(
-            [key + b": " + value for key, value in self.headers.items()]
-        )
-        # BUG changed this from \r\n\r\n to \r\n, may need to change back
-        result = b"".join([result, other_headers, b"\r\n"])
+
+        other_headers = b""
+        if self.headers:
+            other_headers = b"\r\n".join(
+                [key + b": " + value for key, value in self.headers.items()]
+            )
+
+        result = b"".join([result, other_headers, b"\r\n\r\n"])
         return result
 
     def conditional_get_string(self, cache_obj: CacheObject) -> bytes:
+        """Given a valid request and the stored Last-Modified date for the request, generate a conditional get request
+
+        Args:
+            cache_obj (CacheObject): Object containing valid HTTP request and it's Last-Modified date as bytestrings
+
+        Returns:
+            bytes: Conditional get request
+        """
         tokens = [
             b"GET ",
             self.path,
@@ -140,240 +167,16 @@ class ParsedRequest:
             b"Host: ",
             self.hostname,
             b":",
-            str(self.port).encode(),
+            (str(self.port)).encode(),
             b"\r\n",
-            b"If-modified-since: ",
-            cache_obj.date_to_string().encode(),
+            b"If-Modified-Since: ",
+            cache_obj.date,
             b"\r\n",
             b"Connection: close\r\n",
-            b"\r\n",
+            b"\r\n\r\n",
         ]
         conditional_get_req = b"".join(tokens)
         return conditional_get_req
-
-
-#: cache keys are `<hostname><path>` and values are CacheObject (response + date)
-cache: dict[bytes, CacheObject] = {}
-
-blocklist: set[bytes] = set()
-cache_enabled = False
-blocklist_enabled = False
-
-
-def get_date_from_response(response: bytes) -> datetime:
-    """Generate a datetime object from the 'Date' header of a response
-
-    Args:
-        response (bytes): Entire response sent from origin server
-
-    Returns:
-        datetime: Date header converted to a datetime object
-    """
-    response_items = response.split(b"\r\n")
-    for item in response_items:
-        if item.startswith(b"Date:"):
-            date_string = item.split(b" ", 1)[1].decode()
-            return email.utils.parsedate_to_datetime(date_string)
-
-    # if no date header is found just put the current date/time
-    return email.utils.localtime()
-
-
-def update_cache(response: bytes, url: bytes) -> bool:
-    """Update the cache based on the origin's response for the specified url.
-
-    - 200 OK -> cache gets updated with the new object and time sent in response. Return True.
-    - 304 Not Modified -> cache is not modified. Return True.
-    - Anything else (e.g. 401, 404, etc) -> url is removed from cache. Return False.
-
-    Args:
-        response (bytes): Response sent back from the origin server
-        url (bytes): URL being requested by the client
-
-    Returns:
-        bool: True if the server sends a successful response (200 or 304), False if it sends an error response (e.g 404)
-    """
-    response_items = response.split(b"\r\n")
-
-    # extract the status code from the response
-    http_status = response_items[0].split()[1]
-
-    if http_status == b"200":
-        # 200 code from conditional get means object is updated, so update the cache with it
-        cache[url] = CacheObject(response, get_date_from_response(response))
-        return True
-    elif http_status == b"304":
-        # 304 Not Modified means no need to change cache
-        return True
-    else:
-        # anything other than 200 or 304 is bad -> invalidate cached object
-        if url in cache:
-            cache.pop(url)
-        return False
-
-
-def handle_proxy_command(request: ParsedRequest) -> bytes:
-    """Handles a request sent by the client that contains a command URL for the proxy (e.g. /proxy/cache/enable or /proxy/blacklist/flush)
-
-    Args:
-        request (ParsedRequest): ParsedRequest object containing the client's request
-
-    Raises:
-        ValueError: If the ParsedRequest object has no path this error is thrown (should never happen)
-
-    Returns:
-        bytes: "200 OK" HTTP response message, or "400 Bad Request" if client sends an invalid command URL
-    """
-    if request.path == None:
-        raise ValueError("handle_proxy_command called on request with null path")
-    assert request.path.startswith(b"/proxy")
-
-    response = ok_response
-
-    command = request.path
-    match command:
-        case "/proxy/cache/enable":
-            cache_enabled = True
-        case "/proxy/cache/disable":
-            cache_enabled = False
-        case "/proxy/cache/flush":
-            cache.clear()
-        case "/proxy/blocklist/enable":
-            blocklist_enabled = True
-        case "/proxy/blocklist/disable":
-            blocklist_enabled = False
-        case "/proxy/blocklist/flush":
-            blocklist.clear()
-        case re.match("\/proxy\/blocklist\/add\/\S+"):
-            string_to_add = request.path.split(b"/", 4)[-1]
-            blocklist.add(string_to_add)
-        case re.match("\/proxy\/blocklist\/remove\/\S+"):
-            string_to_remove = request.path.split(b"/", 4)[-1]
-            if string_to_remove in blocklist:
-                blocklist.remove(string_to_remove)
-            else:
-                response = bad_req_response
-        case _:
-            if command.startswith(b"/proxy/blocklist/add/"):
-                string_to_add = request.path.split(b"/", 4)[-1]
-                blocklist.add(string_to_add)
-            elif command.startswith(b"/proxy/blocklist/remove/"):
-                string_to_remove = request.path.split(b"/", 4)[-1]
-                if string_to_remove in blocklist:
-                    blocklist.remove(string_to_remove)
-                else:
-                    response = bad_req_response
-            else:
-                logging.debug(request.path)
-                response = bad_req_response
-
-    return response
-
-
-def handle_request_with_blocklist(parsed_request: ParsedRequest, client_skt: socket):
-    host_string = b"".join(
-        [parsed_request.hostname, b":", str(parsed_request.port).encode()]
-    )
-    for blocked in blocklist:
-        # if host_string contains any string that is in the blocklist send "403 Forbidden"
-        if blocked in host_string:
-            client_skt.sendall(forbidden_response)
-            client_skt.close()
-            return
-
-    if cache_enabled:
-        handle_request_with_cache(parsed_request, client_skt)
-    else:
-        handle_request_standard(parsed_request, client_skt)
-
-
-def handle_request_with_cache(parsed_request: ParsedRequest, client_skt: socket):
-    # TODO
-    # 1. check if requested object is in the cache
-    #     a. if not, carry out request like usual
-    #     b. if so, verify object is up to date by issuing conditional GET to origin
-    #         x. if origin response indicates object has not been modified, then good to go
-    #         y. if origin indicates object is out of date, update object per response from origin
-    # 2. If necessary, update cache with up to date version of object and timestamp
-    # 3. respond to client with up to date object
-    hostname = parsed_request.hostname
-    port_bytes = str(parsed_request.port).encode()
-    path = parsed_request.path
-    url = b"".join([hostname, b":", port_bytes, path])
-
-    logging.debug(f"Value of url in handle_request_with_cache: {url}")
-
-    if url in cache:
-        # site has been cached, send conditional GET to origin to check if object is up to date
-        with socket(AF_INET, SOCK_STREAM) as origin_skt:
-            origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
-            origin_skt.sendall(parsed_request.conditional_get_string(cache[url]))
-
-            # Get response from origin-- read until origin sends empty string, indicating end of stream
-            origin_response = b""
-            while True:
-                temp = origin_skt.recv(4096)
-                if temp == b"":
-                    break
-                origin_response += temp
-
-            # Modify cache if necessary based on response
-            response_successful = update_cache(origin_response, url)
-
-            if response_successful:
-                client_skt.sendall(cache[url])
-            else:
-                client_skt.sendall(origin_response)
-
-            client_skt.close()
-            origin_skt.close()
-
-    else:
-        # site has not been cached, carry out request per usual and store response in cache
-        # handle case where response does not include a date/time
-        with socket(AF_INET, SOCK_STREAM) as origin_skt:
-            origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
-            origin_skt.sendall(parsed_request.to_request_string())
-
-            # Get response from origin-- read until origin sends empty string, indicating end of stream
-            origin_response = b""
-            while True:
-                temp = origin_skt.recv(4096)
-                if temp == b"":
-                    break
-                origin_response += temp
-
-            response_successful = update_cache(origin_response, url)
-
-            if response_successful:
-                client_skt.sendall(cache[url])
-            else:
-                # if response is 401, 404, etc., don't consult cache and just send the response straight back to client
-                client_skt.sendall(origin_response)
-                client_skt.close()
-                origin_skt.close()
-
-
-def handle_request_standard(parsed_request: ParsedRequest, client_skt: socket):
-    # Connect to origin server
-    with socket(AF_INET, SOCK_STREAM) as origin_skt:
-        origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
-
-        # Forward client's request to origin
-        origin_skt.sendall(parsed_request.to_request_string())
-
-        # Get response from origin-- read until origin sends empty string, indicating end of stream
-        origin_response = b""
-        while True:
-            temp = origin_skt.recv(4096)
-            if temp == b"":
-                break
-            origin_response += temp
-
-        # Send response back to client
-        client_skt.sendall(origin_response)
-        client_skt.close()
-        origin_skt.close()
 
 
 def parse_request(
@@ -428,8 +231,8 @@ def parse_request(
     headers_arr = headers_data.split(b"\r\n")
     headers_arr = [x for x in headers_arr if x.strip()]  # remove whitespace lines
     for line in headers_arr:
-        # Pattern to match valid header. A valid header is "<name>: <value>",
-        #   there is no whitespace before the colon, and one space after it
+        # Pattern to match valid header.
+        # A valid header is "<name>: <value>",there is no whitespace before the colon, and one space after it
         # <value> is allowed to contain a colon, as long as it has text on both sides of it
         if re.search(r"^[^:]+[^\s]: (([^:]+)|(.*\S:\S.*))$".encode(), line):
             name, value = line.split(b":", 1)
@@ -437,7 +240,7 @@ def parse_request(
             # invalid header if it does not match the regex
             return ParsedRequest(ParseError.BADREQ, None, None, None, None)
 
-        # Omit "Connection: <value>" header. I add this in manually in ParsedRequest.to_request_string()
+        # Omit "Connection: <value>" header. This gets added manually in ParsedRequest.to_request_string()
         if name == b"Connection":
             continue
 
@@ -456,6 +259,256 @@ def parse_request(
     return ParsedRequest(None, host, port, path, headers)
 
 
+def get_last_modified_date_from_response(response: bytes) -> bytes:
+    """Extract the 'Last-Modified' header of a response
+
+    Args:
+        response (bytes): Entire response sent from origin server
+
+    Returns:
+        bytes: Last-Modified header of response
+    """
+    response_items = response.split(b"\r\n")
+    for item in response_items:
+        if item.startswith(b"Last-Modified:"):
+            date_string = item.split(b" ", 1)[1]
+            return date_string
+
+    # if no date header is found just put the current date/time
+    current_time = datetime.utcnow()
+    # format like 'Sat, 22 Jan 2022 23:19:27 GMT'
+    formatted_current_time = current_time.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return formatted_current_time.encode()
+
+
+def handle_proxy_command(request: ParsedRequest) -> bytes:
+    """Handles a request sent by the client that contains a command URL for the proxy (e.g. /proxy/cache/enable or /proxy/blacklist/flush)
+
+    Args:
+        request (ParsedRequest): ParsedRequest object containing the client's request
+
+    Raises:
+        ValueError: If the ParsedRequest object has no path this error is thrown (should never happen)
+
+    Returns:
+        bytes: "200 OK" HTTP response message, or "400 Bad Request" if client sends an invalid command URL
+    """
+    global cache_enabled
+    global blocklist_enabled
+
+    if request.path == None:
+        raise ValueError("handle_proxy_command called on request with null path")
+    assert request.path.startswith(b"/proxy")
+
+    response = ok_response
+
+    command = request.path
+    match command:
+        case b"/proxy/cache/enable":
+            cache_enabled = True
+        case b"/proxy/cache/disable":
+            cache_enabled = False
+        case b"/proxy/cache/flush":
+            cache.clear()
+        case b"/proxy/blocklist/enable":
+            blocklist_enabled = True
+        case b"/proxy/blocklist/disable":
+            blocklist_enabled = False
+        case b"/proxy/blocklist/flush":
+            blocklist.clear()
+        case _:
+            if command.startswith(b"/proxy/blocklist/add/"):
+                string_to_add = request.path.split(b"/", 4)[-1]
+                blocklist.add(string_to_add)
+            elif command.startswith(b"/proxy/blocklist/remove/"):
+                string_to_remove = request.path.split(b"/", 4)[-1]
+                if string_to_remove in blocklist:
+                    blocklist.remove(string_to_remove)
+                else:
+                    response = bad_req_response
+            else:
+                logging.debug(
+                    f"line 267 in handle_proxy_command: unhandled proxy command: {request.path}"
+                )
+                response = bad_req_response
+
+    return response
+
+
+def update_cache(response: bytes, url: bytes) -> bool:
+    """Update the cache based on the origin's response for the specified url.
+
+    - 200 OK -> cache gets updated with the new object and time sent in response. Return True.
+    - 304 Not Modified -> cache is not modified. Return True.
+    - Anything else (e.g. 401, 404, etc) -> url is removed from cache. Return False.
+
+    Args:
+        response (bytes): Response sent back from the origin server
+        url (bytes): URL being requested by the client
+
+    Returns:
+        bool: True if the server sends a successful response (200 or 304), False if it sends an error response (e.g 404)
+    """
+    response_items = response.split(b"\r\n")
+
+    # extract the status code from the response
+    http_status = response_items[0].split()[1]
+
+    if http_status == b"200":
+        # 200 code from conditional get means object is updated, so update the cache with it
+        cache[url] = CacheObject(
+            response, get_last_modified_date_from_response(response)
+        )
+        return True
+    elif http_status == b"304":
+        # 304 Not Modified means no need to change cache
+        return True
+    else:
+        # anything other than 200 or 304 is bad -> invalidate cached object
+        if url in cache:
+            cache.pop(url)
+        return False
+
+
+def handle_request_with_cache(parsed_request: ParsedRequest, client_skt: socket):
+    """Process a request from a client when the proxy cache is enabled
+
+    Overview:
+    - check if requested object is in the cache
+    - if not, carry out request like usual
+    - if so, verify object is up to date by issuing conditional GET to origin
+    - if origin replies 304, then object is unmodified and things are good to go
+    - if origin replies 200, object has been modified -> update object and date in cache
+    - respond to client with up to date object from cache
+
+    Args:
+        parsed_request (ParsedRequest): Client's request
+        client_skt (socket): Client socket
+
+    """
+    if parsed_request.hostname is None or parsed_request.path is None:
+        raise ValueError("handle_request_with_cache: invalid request")
+
+    hostname = parsed_request.hostname
+    port_bytes = str(parsed_request.port).encode()
+    path = parsed_request.path
+
+    url = b"".join([hostname, b":", port_bytes, path])
+
+    if url in cache:
+        # site has been cached, send conditional GET to origin to check if object is up to date
+        with socket(AF_INET, SOCK_STREAM) as origin_skt:
+            origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
+            origin_skt.sendall(parsed_request.conditional_get_string(cache[url]))
+
+            # Get response from origin-- read until origin sends empty string, indicating end of stream
+            origin_response = b""
+            while True:
+                temp = origin_skt.recv(4096)
+                if temp == b"":
+                    break
+                origin_response += temp
+
+            # Modify cache if necessary based on response
+            response_successful = update_cache(origin_response, url)
+
+            if response_successful:
+                client_skt.sendall(cache[url].response)
+            else:
+                client_skt.sendall(origin_response)
+
+            client_skt.close()
+            origin_skt.close()
+
+    else:
+        # site has not been cached, carry out request per usual and store response in cache
+        with socket(AF_INET, SOCK_STREAM) as origin_skt:
+            origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
+            origin_skt.sendall(parsed_request.to_request_string())
+
+            # Get response from origin-- read until origin sends empty string, indicating end of stream
+            origin_response = b""
+            while True:
+                temp = origin_skt.recv(4096)
+                if temp == b"":
+                    break
+                origin_response += temp
+
+            response_successful = update_cache(origin_response, url)
+
+            if response_successful:
+                client_skt.sendall(cache[url].response)
+            else:
+                # if response is 401, 404, etc., don't consult cache and just send the response straight back to client
+                client_skt.sendall(origin_response)
+
+            client_skt.close()
+            origin_skt.close()
+
+
+def handle_request_with_blocklist(parsed_request: ParsedRequest, client_skt: socket):
+    """Process a request from a client when the proxy blocklist is enabled
+
+    Args:
+        parsed_request (ParsedRequest): Client's request
+        client_skt (socket): Client socket
+    """
+    host_string = b""
+    if parsed_request.hostname:  # hostname must not be None
+        host_string = b"".join(
+            [parsed_request.hostname, b":", str(parsed_request.port).encode()]
+        )
+    else:
+        raise ValueError("handle_request_with_blocklist: request hostname is None")
+
+    for blocked in blocklist:
+        # if host_string contains any string that is in the blocklist, send "403 Forbidden"
+        if blocked in host_string:
+            client_skt.sendall(forbidden_response)
+            client_skt.close()
+            return
+
+    if cache_enabled:
+        handle_request_with_cache(parsed_request, client_skt)
+    else:
+        handle_request_standard(parsed_request, client_skt)
+
+
+def handle_request_standard(parsed_request: ParsedRequest, client_skt: socket):
+    """Process a request from a client when the proxy blocklist and cache are DISABLED
+
+    Overview:
+    - connect to origin
+    - forward client request to origin
+    - recv origin's response
+    - forward response back to client
+    - close connections
+
+    Args:
+        parsed_request (ParsedRequest): Client's request
+        client_skt (socket): Client socket
+    """
+    assert parsed_request.hostname is not None
+    # Connect to origin server
+    with socket(AF_INET, SOCK_STREAM) as origin_skt:
+        origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
+        # Forward client's request to origin
+        origin_skt.sendall(parsed_request.to_request_string())
+
+        # Get response from origin-- read until origin sends empty string, indicating end of stream
+        origin_response = b""
+        while True:
+            temp = origin_skt.recv(4096)
+            if temp == b"":
+                break
+            origin_response += temp
+
+        # Send response back to client
+        client_skt.sendall(origin_response)
+        client_skt.close()
+        origin_skt.close()
+
+
 def communicate_with_client(client_skt: socket, client_address):
     """Once connection is established with a client, revc message from them, forward message to origin server, then forward origin response back to client
 
@@ -472,7 +525,6 @@ def communicate_with_client(client_skt: socket, client_address):
             break
 
     # Parse HTTP request:
-    logging.debug(client_request.decode())
     parsed_request = parse_request(client_request)
 
     # if invalid just send straight back to the client and close the connection
@@ -482,13 +534,12 @@ def communicate_with_client(client_skt: socket, client_address):
         return
 
     # Check if request is a cache or blocklist command:
+    assert parsed_request.path is not None  # appease type checker
     if parsed_request.path.startswith(b"/proxy"):
         proxy_command_response = handle_proxy_command(parsed_request)
         client_skt.sendall(proxy_command_response)
         client_skt.close()  # TODO maybe keep this open?
         return
-
-    logging.debug(parsed_request.to_request_string().decode())
 
     # Handle request processing based on status of blocklist and cache:
     if blocklist_enabled:
@@ -497,28 +548,9 @@ def communicate_with_client(client_skt: socket, client_address):
         handle_request_with_cache(parsed_request, client_skt)
     else:
         handle_request_standard(parsed_request, client_skt)
-    # # Connect to origin server
-    # with socket(AF_INET, SOCK_STREAM) as origin_skt:
-    #     origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
-
-    #     # Forward client's request to origin
-    #     origin_skt.sendall(parsed_request.to_request_string())
-
-    #     # Get response from origin-- read until origin sends empty string, indicating end of stream
-    #     origin_response = b""
-    #     while True:
-    #         temp = origin_skt.recv(4096)
-    #         if temp == b"":
-    #             break
-    #         origin_response += temp
-
-    #     # Send response back to client
-    #     client_skt.sendall(origin_response)
-    #     client_skt.close()
-    #     origin_skt.close()
 
 
-# Start of program execution
+#### START OF PROGRAM EXECUTION ####
 # Parse out the command line server address and port number to listen to
 parser = OptionParser()
 parser.add_option("-p", type="int", dest="serverPort")
@@ -547,6 +579,7 @@ with socket(AF_INET, SOCK_STREAM) as listen_skt:
         # establish connection with client
         client_skt, client_address = listen_skt.accept()
 
+        # handle connection on new thread
         client_thread = threading.Thread(
             target=communicate_with_client, args=(client_skt, client_address)
         )
