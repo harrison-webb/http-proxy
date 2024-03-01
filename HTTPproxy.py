@@ -15,19 +15,19 @@ Big picture:
 5. Proxy waits for response from origin, sends the response back to client, then closes connections
 """
 
-from socket import *
-from urllib.parse import urlparse
-from enum import Enum
+import email.utils
+import logging
+import re
+import signal
+import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime
-import email.utils
-import threading
-import re
-from typing import Optional
-import signal
+from enum import Enum
 from optparse import OptionParser
-import sys
-import logging
+from socket import *
+from typing import Optional
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.ERROR)
 http_methods = {b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS"}
@@ -47,14 +47,18 @@ def ctrl_c_pressed(signal, frame):
 
 @dataclass
 class CacheObject:
-    object: bytes
+    response: bytes
     date: datetime
 
     def date_to_string(self):
         # https://stackoverflow.com/a/42693352
         # this formats October 3rd 2015 as "Sat, 03 Oct 2015 <time> -<something>"
-        # BUG might need to fix the day of month from "03" to "3"
+        # BUG might need to fix the day of month from "03" to "3" # TODO
         return email.utils.format_datetime(self.date)
+
+    def to_response(self):
+        # TODO
+        True
 
 
 # Request parsing
@@ -148,23 +152,47 @@ class ParsedRequest:
         return conditional_get_req
 
 
-# cache keys are `<hostname><path>` and values are CacheObject (object @ url + date)
+#: cache keys are `<hostname><path>` and values are CacheObject (response + date)
 cache: dict[bytes, CacheObject] = {}
+
 blocklist: set[bytes] = set()
 cache_enabled = False
 blocklist_enabled = False
 
 
 def get_date_from_response(response: bytes) -> datetime:
-    # might be better to create an entire parse_response function but this works for now
+    """Generate a datetime object from the 'Date' header of a response
+
+    Args:
+        response (bytes): Entire response sent from origin server
+
+    Returns:
+        datetime: Date header converted to a datetime object
+    """
     response_items = response.split(b"\r\n")
     for item in response_items:
         if item.startswith(b"Date:"):
             date_string = item.split(b" ", 1)[1].decode()
             return email.utils.parsedate_to_datetime(date_string)
 
+    # if no date header is found just put the current date/time
+    return email.utils.localtime()
 
-def update_cache(response: bytes, url: bytes):
+
+def update_cache(response: bytes, url: bytes) -> bool:
+    """Update the cache based on the origin's response for the specified url.
+
+    - 200 OK -> cache gets updated with the new object and time sent in response. Return True.
+    - 304 Not Modified -> cache is not modified. Return True.
+    - Anything else (e.g. 401, 404, etc) -> url is removed from cache. Return False.
+
+    Args:
+        response (bytes): Response sent back from the origin server
+        url (bytes): URL being requested by the client
+
+    Returns:
+        bool: True if the server sends a successful response (200 or 304), False if it sends an error response (e.g 404)
+    """
     response_items = response.split(b"\r\n")
 
     # extract the status code from the response
@@ -172,7 +200,16 @@ def update_cache(response: bytes, url: bytes):
 
     if http_status == b"200":
         # 200 code from conditional get means object is updated, so update the cache with it
-        cache[url] = CacheObject(response_items[-1], get_date_from_response(response))
+        cache[url] = CacheObject(response, get_date_from_response(response))
+        return True
+    elif http_status == b"304":
+        # 304 Not Modified means no need to change cache
+        return True
+    else:
+        # anything other than 200 or 304 is bad -> invalidate cached object
+        if url in cache:
+            cache.pop(url)
+        return False
 
 
 def handle_proxy_command(request: ParsedRequest) -> bytes:
@@ -280,15 +317,41 @@ def handle_request_with_cache(parsed_request: ParsedRequest, client_skt: socket)
                     break
                 origin_response += temp
 
-            # update cache with updated object if needed
-            update_cache(origin_response, url)
+            # Modify cache if necessary based on response
+            response_successful = update_cache(origin_response, url)
 
-            # send object to client
-            # TODO
+            if response_successful:
+                client_skt.sendall(cache[url])
+            else:
+                client_skt.sendall(origin_response)
+
+            client_skt.close()
+            origin_skt.close()
 
     else:
         # site has not been cached, carry out request per usual and store response in cache
-        True
+        # handle case where response does not include a date/time
+        with socket(AF_INET, SOCK_STREAM) as origin_skt:
+            origin_skt.connect((parsed_request.hostname.decode(), parsed_request.port))
+            origin_skt.sendall(parsed_request.to_request_string())
+
+            # Get response from origin-- read until origin sends empty string, indicating end of stream
+            origin_response = b""
+            while True:
+                temp = origin_skt.recv(4096)
+                if temp == b"":
+                    break
+                origin_response += temp
+
+            response_successful = update_cache(origin_response, url)
+
+            if response_successful:
+                client_skt.sendall(cache[url])
+            else:
+                # if response is 401, 404, etc., don't consult cache and just send the response straight back to client
+                client_skt.sendall(origin_response)
+                client_skt.close()
+                origin_skt.close()
 
 
 def handle_request_standard(parsed_request: ParsedRequest, client_skt: socket):
