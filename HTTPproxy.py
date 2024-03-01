@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from optparse import OptionParser
-from socket import *
+from socket import AF_INET, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, socket
 from typing import Optional
 from urllib.parse import urlparse
 
